@@ -1855,6 +1855,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const nextMessages = [...messages, userMsg];
     setMessages(nextMessages);
 
+    // Build continuous project-specific conversation thread so context isn't contaminated by other workspaces
+    const currentProjectConversation = [...activeProjectMessages, userMsg];
+
     let currentBrainResult: BrainProcessResult | null = null;
 
     // AXON Brain Core — Central intelligence processing pipeline (Phase 0 Scaffold)
@@ -1865,7 +1868,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         projectId: activeProjectId,
         attachment,
         context: {
-          conversationHistory: nextMessages,
+          conversationHistory: currentProjectConversation,
           projectNotes: activeProjectNotes,
           systemContext: activeProject?.systemContext || '',
           timelineEvents: projectActivities,
@@ -2117,7 +2120,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             body: JSON.stringify({
               provider: activeModel.provider,
               model: activeModel.id,
-              messages: nextMessages.map((m) =>
+              messages: currentProjectConversation.map((m) =>
                 m.id === userMsg.id ? { sender: m.sender, text: promptForDispatch } : { sender: m.sender, text: m.text }
               ),
               apiKey: currentAccount?.apiKey || '',
@@ -2341,7 +2344,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           projectId: activeProjectId,
           attachment,
           context: {
-            conversationHistory: nextMessages,
+            conversationHistory: currentProjectConversation,
             projectNotes: activeProjectNotes,
             systemContext: activeProject?.systemContext || '',
             timelineEvents: projectActivities,

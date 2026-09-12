@@ -78,6 +78,94 @@ app.post('/api/ai/chat', async (req, res) => {
       formattedContext = `[Context summary from previous session handoff: ${conversationSummary}]\n\n`;
     }
 
+    // Helper: format complete multi-turn message history for Gemini
+    const buildGeminiContents = () => {
+      const geminiContents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [];
+      const validMsgs = (messages || []).filter(
+        (m: any) => m && typeof m.text === 'string' && m.text.trim().length > 0
+      );
+
+      for (let i = 0; i < validMsgs.length; i++) {
+        const m = validMsgs[i];
+        const role: 'user' | 'model' = m.sender === 'user' ? 'user' : 'model';
+        let text = m.text;
+        if (i === 0 && formattedContext) {
+          text = `${formattedContext}${text}`;
+        }
+        const last = geminiContents[geminiContents.length - 1];
+        if (last && last.role === role) {
+          last.parts[0].text += `\n\n${text}`;
+        } else {
+          geminiContents.push({
+            role,
+            parts: [{ text }],
+          });
+        }
+      }
+
+      while (geminiContents.length > 0 && geminiContents[0].role !== 'user') {
+        geminiContents.shift();
+      }
+
+      if (geminiContents.length === 0) {
+        const fallbackText = formattedContext ? `${formattedContext}Hello` : 'Hello';
+        geminiContents.push({ role: 'user', parts: [{ text: fallbackText }] });
+      }
+
+      return geminiContents;
+    };
+
+    // Helper: format complete multi-turn message history for Claude
+    const buildClaudeMessages = () => {
+      const claudeMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+      const validMsgs = (messages || []).filter(
+        (m: any) => m && typeof m.text === 'string' && m.text.trim().length > 0
+      );
+
+      for (let i = 0; i < validMsgs.length; i++) {
+        const m = validMsgs[i];
+        const role: 'user' | 'assistant' = m.sender === 'user' ? 'user' : 'assistant';
+        let text = m.text;
+        if (i === 0 && formattedContext) {
+          text = `${formattedContext}${text}`;
+        }
+        const last = claudeMessages[claudeMessages.length - 1];
+        if (last && last.role === role) {
+          last.content += `\n\n${text}`;
+        } else {
+          claudeMessages.push({ role, content: text });
+        }
+      }
+
+      while (claudeMessages.length > 0 && claudeMessages[0].role !== 'user') {
+        claudeMessages.shift();
+      }
+
+      if (claudeMessages.length === 0) {
+        const fallbackText = formattedContext ? `${formattedContext}Hello` : 'Hello';
+        claudeMessages.push({ role: 'user', content: fallbackText });
+      }
+
+      return claudeMessages;
+    };
+
+    // Helper: format complete multi-turn message history for ChatGPT
+    const buildOpenAiMessages = () => {
+      const validMsgs = (messages || []).filter(
+        (m: any) => m && typeof m.text === 'string' && m.text.trim().length > 0
+      );
+
+      if (validMsgs.length === 0) {
+        const fallbackText = formattedContext ? `${formattedContext}Hello` : 'Hello';
+        return [{ role: 'user', content: fallbackText }];
+      }
+
+      return validMsgs.map((m: any, idx: number) => ({
+        role: m.sender === 'user' ? 'user' : 'assistant',
+        content: idx === 0 && formattedContext ? `${formattedContext}${m.text}` : m.text,
+      }));
+    };
+
     // 1. GOOGLE GEMINI (Official @google/genai SDK)
     if (rawProvider === 'gemini') {
       const activeKey = apiKey || process.env.GEMINI_API_KEY;
@@ -98,15 +186,11 @@ app.post('/api/ai/chat', async (req, res) => {
         },
       });
 
-      // Format message history
-      const lastUserMsg = messages[messages.length - 1]?.text || 'Hello';
-      const promptContent = formattedContext ? `${formattedContext}${lastUserMsg}` : lastUserMsg;
-
       try {
         const geminiModel = model || 'gemini-3.8-flash';
         const response = await ai.models.generateContent({
           model: geminiModel,
-          contents: promptContent,
+          contents: buildGeminiContents(),
           config: {
             systemInstruction,
             temperature: 0.7,
@@ -155,16 +239,7 @@ app.post('/api/ai/chat', async (req, res) => {
       }
 
       const claudeModel = model || 'claude-3-5-sonnet-20241022';
-
-      // Build Claude messages array
-      const history = (messages || []).slice(-6).map((m: any) => ({
-        role: m.sender === 'user' ? 'user' : 'assistant',
-        content: m.text,
-      }));
-
-      if (formattedContext && history.length > 0) {
-        history[0].content = `${formattedContext}${history[0].content}`;
-      }
+      const claudeMessages = buildClaudeMessages();
 
       const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -177,7 +252,7 @@ app.post('/api/ai/chat', async (req, res) => {
           model: claudeModel,
           max_tokens: 1024,
           system: systemInstruction,
-          messages: history.length > 0 ? history : [{ role: 'user', content: 'Hello' }],
+          messages: claudeMessages,
         }),
       });
 
@@ -215,15 +290,7 @@ app.post('/api/ai/chat', async (req, res) => {
       }
 
       const gptModel = model || 'gpt-4o';
-
-      const history = (messages || []).slice(-6).map((m: any) => ({
-        role: m.sender === 'user' ? 'user' : 'assistant',
-        content: m.text,
-      }));
-
-      if (formattedContext && history.length > 0) {
-        history[0].content = `${formattedContext}${history[0].content}`;
-      }
+      const openAiHistory = buildOpenAiMessages();
 
       const openAiRes = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
@@ -233,7 +300,7 @@ app.post('/api/ai/chat', async (req, res) => {
         },
         body: JSON.stringify({
           model: gptModel,
-          messages: [{ role: 'system', content: systemInstruction }, ...history],
+          messages: [{ role: 'system', content: systemInstruction }, ...openAiHistory],
           max_tokens: 1024,
         }),
       });
@@ -273,11 +340,9 @@ app.post('/api/ai/chat', async (req, res) => {
             apiKey: activeKey,
             httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
           });
-          const lastUserMsg = messages[messages.length - 1]?.text || 'Hello';
-          const promptContent = formattedContext ? `${formattedContext}${lastUserMsg}` : lastUserMsg;
           const response = await ai.models.generateContent({
             model: 'gemini-3.8-flash',
-            contents: promptContent,
+            contents: buildGeminiContents(),
             config: { systemInstruction, temperature: 0.7 },
           });
           return res.json({ success: true, text: response.text || 'I am ready to help.' });
@@ -287,6 +352,45 @@ app.post('/api/ai/chat', async (req, res) => {
       }
       const lastUserMsg = (messages[messages.length - 1]?.text || '').trim();
       const norm = lastUserMsg.toLowerCase();
+      const priorTurns = (messages || []).slice(0, -1);
+      const lastAssistantTurn = [...priorTurns].reverse().find(
+        (m: any) => m && (m.sender === 'axon' || m.sender === 'assistant' || m.sender === 'model')
+      );
+
+      // Tone or style adjustment
+      if (
+        /(?:too robotic|more natural|change (?:the |your )?tone|adjust (?:the |your )?tone|rephrase|rewrite|less robotic|too formal|less formal|sound more human|make it (?:simpler|shorter|more concise|warmer|clearer)|can you change (?:the way|how|it))\b/i.test(
+          norm
+        )
+      ) {
+        let cleaned = (lastAssistantTurn?.text || '')
+          .replace(/\*\*(?:Executive Summary|Objective Identified|Active Local Status|Key Requirements|Verification & Notes)\*\*:\s*/gi, '')
+          .replace(/I have received and processed your inquiry.*?in offline mode\.\s*/gi, '')
+          .replace(/Workspace tools, deterministic calculations.*?\.\s*/gi, '')
+          .trim();
+        return res.json({
+          success: true,
+          text: `Understood! Let me say that in a much more natural voice:\n\n${cleaned || 'I will make sure my responses stay clear, direct, and conversational.'}`,
+        });
+      }
+
+      // Affirmative continuation of prior proposal (e.g. "yes", "sure", "go ahead")
+      if (
+        /^(?:yes|yep|yeah|sure|ok|okay|sounds good|go ahead|proceed|do it|please do|let's do (?:it|that)|absolutely|definitely|variant \d+|option \d+)[.!]?$/i.test(
+          norm
+        ) &&
+        lastAssistantTurn
+      ) {
+        const priorText = lastAssistantTurn.text;
+        const subjectMatch =
+          priorText.match(/(?:build|create|design|implement|develop|work on|outline|plan|variant)\s+(?:a |an |the )?([a-zA-Z0-9_\- ]{3,40})/i) ||
+          priorText.match(/\*\*([a-zA-Z0-9_\- ]{3,40})\*\*/);
+        const subject = subjectMatch ? subjectMatch[1].trim() : 'the proposal';
+        return res.json({
+          success: true,
+          text: `Understood! Continuing with our plan for **${subject}**.\n\nNext steps:\n1. Establish core data structure and state.\n2. Implement interactive game/logic loop.\n3. Render layout with clear status indicators.\n\nWould you like me to start with the logic breakdown or draft the code in your workspace?`,
+        });
+      }
 
       // Greetings
       if (/^(?:hello|hi|hey|greetings|good morning|good afternoon|good evening)\b/i.test(norm)) {

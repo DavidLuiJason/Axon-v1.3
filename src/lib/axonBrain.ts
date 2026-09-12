@@ -98,6 +98,10 @@ export interface BrainIntent {
     requiresExactMath?: boolean;
     requiresOffline?: boolean;
     requiresVision?: boolean;
+    isToneRevision?: boolean;
+    priorResponseText?: string;
+    continuingConversation?: boolean;
+    inReplyToAssistantText?: string;
   };
   isMetaPlanQuery: boolean;
   suggestedHandling: 'local_axon' | 'delegate_external' | 'interactive_query';
@@ -334,6 +338,82 @@ export class AxonBrainCore {
           suggestedHandling: custom.suggestedHandling ?? 'local_axon',
         };
       }
+    }
+
+    // Inspect conversational history if available in context
+    const history = request.context?.conversationHistory || [];
+    const priorTurns = history.filter((m) => m.id !== request.id && m.text !== request.text);
+    const lastAssistantTurn = [...priorTurns].reverse().find(
+      (m) => m.sender === 'axon' || (m as any).sender === 'assistant' || (m as any).sender === 'model'
+    );
+
+    // 0a. Check for Tone or Style adjustment requests
+    const isToneOrStyleAdjustment =
+      /(?:too robotic|more natural|change (?:the |your )?tone|adjust (?:the |your )?tone|rephrase|rewrite|less robotic|too formal|less formal|sound more human|make it (?:simpler|shorter|more concise|warmer|clearer)|can you change (?:the way|how|it)|change how you (?:wrote|said|phrase))\b/i.test(
+        lowerText
+      );
+
+    if (isToneOrStyleAdjustment) {
+      const priorResponseText = lastAssistantTurn?.text || '';
+      return {
+        category: 'conversational',
+        primaryGoal: 'Adjust tone of previous response to be more natural and less robotic',
+        actionVerb: 'synthesize',
+        targetDomain: 'general',
+        complexity: 'low',
+        confidence: 0.95,
+        summary: `User requested a tone adjustment: "${text}". Applying natural conversational phrasing to prior response context.`,
+        detectedEntities: {
+          ...this.extractEntities(priorResponseText),
+          ...this.extractEntities(text),
+        },
+        constraints: {
+          format: 'concise',
+          isToneRevision: true,
+          priorResponseText,
+        },
+        isMetaPlanQuery: false,
+        suggestedHandling: 'local_axon',
+      };
+    }
+
+    // 0b. Check for affirmative confirmation or continuation of prior proposal (e.g., "yes", "sure", "go ahead", "let's do that")
+    const isAffirmative =
+      /^(?:yes|yep|yeah|sure|ok|okay|sounds good|go ahead|proceed|do it|please do|let's do (?:it|that)|absolutely|definitely|variant \d+|option \d+)[.!]?$/i.test(
+        lowerText
+      ) ||
+      /^(?:yes|sure|go ahead|let's do that)\b/i.test(lowerText);
+
+    if (isAffirmative && lastAssistantTurn) {
+      const priorText = lastAssistantTurn.text;
+      const subjectMatch =
+        priorText.match(/(?:build|create|design|implement|develop|work on|outline|plan|variant)\s+(?:a |an |the )?([a-zA-Z0-9_\- ]{3,40})/i) ||
+        priorText.match(/\*\*([a-zA-Z0-9_\- ]{3,40})\*\*/);
+      const subject = subjectMatch ? subjectMatch[1].trim() : 'the proposed plan';
+
+      const isCodeOrArchitecture = /(?:game|app|component|code|script|database|api|backend|frontend|chess|tool)/i.test(
+        priorText
+      );
+
+      return {
+        category: isCodeOrArchitecture ? 'code_architecture_or_design' : 'conversational',
+        primaryGoal: `Proceed with prior proposal: ${subject}`,
+        actionVerb: isCodeOrArchitecture ? 'code' : 'plan',
+        targetDomain: isCodeOrArchitecture ? 'software' : 'general',
+        complexity: 'medium',
+        confidence: 0.92,
+        summary: `User accepted prior assistant proposal ("${text}"). Continuing with ${subject}.`,
+        detectedEntities: {
+          ...this.extractEntities(priorText),
+          ...this.extractEntities(text),
+        },
+        constraints: {
+          continuingConversation: true,
+          inReplyToAssistantText: priorText,
+        },
+        isMetaPlanQuery: false,
+        suggestedHandling: 'local_axon',
+      };
     }
 
     // 1. Check for Meta-Query asking to explain AXON's plan, reasoning, or decision
@@ -1188,6 +1268,50 @@ export class AxonBrainCore {
       }
 
       default: {
+        if (intent.constraints?.isToneRevision) {
+          rationale = 'User requested stylistic/tone adjustment for previous response context.';
+          steps.push({
+            stepIndex: 1,
+            title: 'Isolate Prior Response Context',
+            handler: 'axon_local',
+            status: 'pending',
+            summary: 'Review previous turn and isolate stylistic points to soften and naturalize.',
+            estimatedEffort: 'minimal',
+          });
+          steps.push({
+            stepIndex: 2,
+            title: 'Rephrase in Warm, Natural Tone',
+            handler: 'axon_local',
+            status: 'pending',
+            summary: 'Formulate response with natural, human cadence and simplified phrasing.',
+            estimatedEffort: 'minimal',
+          });
+          explanation = 'Adjusting the tone of my prior response to be more natural and less robotic.';
+          break;
+        }
+
+        if (intent.constraints?.continuingConversation) {
+          rationale = 'Continuing multi-turn conversational thread based on user confirmation.';
+          steps.push({
+            stepIndex: 1,
+            title: 'Recall Agreed Proposal Context',
+            handler: 'axon_local',
+            status: 'pending',
+            summary: `Retrieve parameters from prior turn: ${intent.primaryGoal}.`,
+            estimatedEffort: 'minimal',
+          });
+          steps.push({
+            stepIndex: 2,
+            title: 'Execute Implementation Next Steps',
+            handler: 'axon_local',
+            status: 'pending',
+            summary: 'Synthesize actionable design, rules, and code breakdown.',
+            estimatedEffort: 'minimal',
+          });
+          explanation = `Continuing with our agreed plan: ${intent.primaryGoal}.`;
+          break;
+        }
+
         rationale = 'Conversational request addressed directly through AXON local intelligence with project context.';
         steps.push({
           stepIndex: 1,
@@ -1685,7 +1809,32 @@ export class AxonBrainCore {
       ].join('\n');
     }
 
-    // 12. Conversational greetings & direct follow-up inquiries
+    // 12. Tone or style adjustment requested
+    if (intent.constraints && intent.constraints.isToneRevision) {
+      const priorText = intent.constraints.priorResponseText || '';
+      return [
+        `I appreciate the feedback. Let me rephrase that in a much more natural, conversational voice:`,
+        '',
+        this.simplifyTone(priorText),
+      ].join('\n');
+    }
+
+    // 13. Continuation of prior proposal (e.g., user said "yes", "sure", "go ahead", "let's do that")
+    if (intent.constraints && intent.constraints.continuingConversation) {
+      const goal = intent.primaryGoal.replace(/^Proceed with prior proposal:\s*/i, '');
+      return [
+        `Understood! Let's continue with **${goal}**.`,
+        '',
+        `Here is our immediate execution outline to get this underway:`,
+        `1. **Define Core Rules & State**: Establish the baseline data structure and configuration.`,
+        `2. **Build Interactive Mechanics**: Implement move validation, turn state, and game loop logic.`,
+        `3. **UI / Presentation**: Render the board and pieces with clear turn indicators.`,
+        '',
+        `Would you like me to draft the starter code in the Code Workspace, or walk through the rule logic first?`,
+      ].join('\n');
+    }
+
+    // 14. Conversational greetings & direct follow-up inquiries
     const greetings = ['hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening', 'greetings', 'sup', 'yo'];
     const isPureGreeting = greetings.includes(lowerText) || /^(?:hello|hi|hey)\b/i.test(lowerText);
 
@@ -1711,6 +1860,17 @@ export class AxonBrainCore {
       '',
       `I am ready to proceed. Let me know if you would like me to format this as a step-by-step plan, write a script in the Workspace runner, or save it to your Project Notes.`,
     ].join('\n');
+  }
+
+  private simplifyTone(text: string): string {
+    if (!text) return "Understood. I've noted your preference for a simpler, more conversational tone.";
+    const cleaned = text
+      .replace(/\*\*(?:Executive Summary|Objective Identified|Active Local Status|Key Requirements|Verification & Notes)\*\*:\s*/gi, '')
+      .replace(/I have processed your inquiry.*?using AXON's local reasoning core\.\s*/gi, '')
+      .replace(/Operational in offline workspace mode\.\s*/gi, '')
+      .trim();
+
+    return cleaned || "Understood! I will keep our responses straightforward, warm, and natural.";
   }
 }
 
